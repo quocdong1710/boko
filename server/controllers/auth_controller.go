@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,6 +16,23 @@ import (
 	"boko/middleware"
 	"boko/models"
 )
+
+var dummyOnce sync.Once
+var dummyHash []byte
+var dummyInitErr error
+
+func loginDummyHash() ([]byte, error) {
+	dummyOnce.Do(func() {
+		dummyHash, dummyInitErr = bcrypt.GenerateFromPassword(
+			[]byte("not-a-real-account-password"), bcrypt.DefaultCost,
+		)
+	})
+	return dummyHash, dummyInitErr
+}
+
+func init() {
+	_, _ = loginDummyHash()
+}
 
 func decryptPhoneIfNeeded(rawPhone string) string {
 	if strings.TrimSpace(rawPhone) == "" {
@@ -60,8 +78,13 @@ func Register(c *gin.Context) {
 
 	// Kiểm tra email trùng
 	var existing models.User
-	if result := config.DB.Where("email = ?", input.Email).First(&existing); result.Error == nil {
+	result := config.DB.Where("email = ?", input.Email).First(&existing)
+	if result.Error == nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "Email đã được sử dụng"})
+		return
+	}
+	if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể đăng ký tài khoản"})
 		return
 	}
 
@@ -89,7 +112,10 @@ func Register(c *gin.Context) {
 		Phone:    phoneCipherText,
 		Role:     "customer",
 	}
-	config.DB.Create(&user)
+	if err := config.DB.Create(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể đăng ký tài khoản"})
+		return
+	}
 
 	// Tạo JWT ngay khi đăng ký thành công
 	regToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -125,18 +151,32 @@ func Login(c *gin.Context) {
 	}
 
 	// Frontend gửi identifier (email hoặc username); backend hỗ trợ cả 2
-	loginKey := input.Email
+	loginKey := strings.TrimSpace(input.Email)
 	if loginKey == "" && input.Identifier != "" {
-		loginKey = input.Identifier
+		loginKey = strings.TrimSpace(input.Identifier)
 	}
-
-	var user models.User
-	if result := config.DB.Where("email = ? OR name = ?", loginKey, loginKey).First(&user); errors.Is(result.Error, gorm.ErrRecordNotFound) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Email hoặc mật khẩu không đúng"})
+	if loginKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu không hợp lệ"})
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
+	var user models.User
+	result := config.DB.Where("email = ? OR name = ?", loginKey, loginKey).First(&user)
+	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+		hash, err := loginDummyHash()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể đăng nhập"})
+			return
+		}
+		_ = bcrypt.CompareHashAndPassword(hash, []byte(input.Password))
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Email hoặc mật khẩu không đúng"})
+		return
+	}
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể đăng nhập"})
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)) != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Email hoặc mật khẩu không đúng"})
 		return
 	}

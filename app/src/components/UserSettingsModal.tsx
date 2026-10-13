@@ -180,7 +180,7 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   useEffect(() => {
     if (activeTab === 'orders' || isOpen) {
       setIsLoadingOrders(true);
-      getMyOrdersApi(user?.email)
+      getMyOrdersApi()
         .then((backendOrders) => {
           if (Array.isArray(backendOrders) && backendOrders.length > 0) {
             const localSaved = (() => {

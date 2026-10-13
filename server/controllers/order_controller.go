@@ -155,26 +155,22 @@ func CreateOrder(c *gin.Context) {
 	})
 }
 
-// GetMyOrders — lịch sử đơn hàng của user (hỗ trợ cả token auth hoặc theo email query)
+// GetMyOrders — lịch sử đơn hàng của user (chỉ dùng user_id từ JWT)
 func GetMyOrders(c *gin.Context) {
-	var orders []models.Order
-	query := config.DB.Preload("Items")
-
-	if val, exists := c.Get("user_id"); exists {
-		if uid, ok := val.(uint); ok && uid > 0 {
-			query = query.Where("user_id = ?", uid)
-		}
-	} else if email := c.Query("email"); email != "" {
-		var user models.User
-		if err := config.DB.Where("email = ?", email).First(&user).Error; err == nil {
-			query = query.Where("user_id = ?", user.ID)
-		} else {
-			c.JSON(http.StatusOK, gin.H{"data": []models.Order{}})
-			return
-		}
+	value, exists := c.Get("user_id")
+	uid, ok := value.(uint)
+	if !exists || !ok || uid == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Yêu cầu đăng nhập"})
+		return
 	}
 
-	query.Order("created_at DESC").Find(&orders)
+	var orders []models.Order
+	if err := config.DB.Preload("Items").
+		Where("user_id = ?", uid).
+		Order("created_at DESC").Find(&orders).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể tải đơn hàng"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": orders})
 }
 
@@ -517,12 +513,17 @@ func ConfirmReceiptOrder(c *gin.Context) {
 
 // GetOrderDetail — chi tiết 1 đơn hàng
 func GetOrderDetail(c *gin.Context) {
-	userID, _ := c.Get("user_id")
+	value, exists := c.Get("user_id")
+	uid, ok := value.(uint)
+	if !exists || !ok || uid == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Yêu cầu đăng nhập"})
+		return
+	}
 	orderID := c.Param("id")
 
 	var order models.Order
 	if result := config.DB.Preload("Items").
-		Where("id = ? AND user_id = ?", orderID, userID).
+		Where("id = ? AND user_id = ?", orderID, uid).
 		First(&order); result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng"})
 		return

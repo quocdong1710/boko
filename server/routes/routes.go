@@ -1,10 +1,16 @@
 package routes
 
 import (
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/gin-gonic/gin"
 
 	"boko/controllers"
 	"boko/middleware"
+	pmiddleware "boko/payments/middleware"
 )
 
 func SetupRoutes(r *gin.Engine) {
@@ -14,13 +20,27 @@ func SetupRoutes(r *gin.Engine) {
 		c.JSON(200, gin.H{"message": "Boko API is running! 🚀"})
 	})
 
+	// Rate limit riêng cho nhóm Auth (áp dụng chung cho cả alias /api/* và /api/auth/*)
+	authRateLimit := 10
+	if v := strings.TrimSpace(os.Getenv("AUTH_RATE_LIMIT")); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			authRateLimit = parsed
+		}
+	}
+	loginRateLimiter := pmiddleware.RateLimitMiddleware(authRateLimit, 1*time.Minute, func(c *gin.Context) string {
+		return "login:" + c.ClientIP()
+	})
+	registerRateLimiter := pmiddleware.RateLimitMiddleware(authRateLimit, 1*time.Minute, func(c *gin.Context) string {
+		return "register:" + c.ClientIP()
+	})
+
 	// Auth — frontend tương thích
-	r.POST("/api/register", controllers.Register)
-	r.POST("/api/login", controllers.Login)
+	r.POST("/api/register", registerRateLimiter, controllers.Register)
+	r.POST("/api/login", loginRateLimiter, controllers.Login)
 
 	// Frontend gọi /api/auth/* (alias cho tương thích)
-	r.POST("/api/auth/login", controllers.Login)
-	r.POST("/api/auth/register", controllers.Register)
+	r.POST("/api/auth/login", loginRateLimiter, controllers.Login)
+	r.POST("/api/auth/register", registerRateLimiter, controllers.Register)
 	r.POST("/api/auth/logout", controllers.Logout)
 
 	// Books (public)
@@ -34,31 +54,40 @@ func SetupRoutes(r *gin.Engine) {
 	// Reviews (public)
 	r.GET("/api/books/:id/reviews", controllers.GetBookReviews)
 
-	// Payments Webhook & Status (public cho MoMo Gateway và trang Callback)
+	// Payments Webhook & Status
 	r.POST("/api/payment/momo/ipn", controllers.MomoIPN)
-	r.POST("/api/payment/momo/mock-ipn/:id", controllers.MockMomoIPN)
-	r.POST("/api/payment/momo/simulator-ipn", controllers.MomoSimulatorIPN)
-	r.GET("/api/payment/momo/status/:id", middleware.AuthOptional, controllers.GetPaymentStatus)
+	r.GET("/api/payment/momo/status/:id", middleware.AuthRequired, controllers.GetPaymentStatus)
 
 	// Payments Create (hỗ trợ cả người dùng đăng nhập và khách)
 	r.POST("/api/payment/momo/create", middleware.AuthOptional, controllers.CreateMomoPayment)
 
 	// VNPAY Payment Routes
 	r.GET("/api/payment/vnpay/ipn", controllers.VnPayIPN)
-	r.GET("/api/payment/vnpay/status/:id", middleware.AuthOptional, controllers.GetVnPayPaymentStatus)
+	r.GET("/api/payment/vnpay/status/:id", middleware.AuthRequired, controllers.GetVnPayPaymentStatus)
 	r.POST("/api/payment/vnpay/create", middleware.AuthOptional, controllers.CreateVnPayPayment)
 
 	// PayPal Payment Routes — cùng cấu trúc với MoMo/VNPay
-	r.POST("/api/payment/paypal/mock-capture/:id", controllers.MockPaypalCapture)
-	r.GET("/api/payment/paypal/status/:id", middleware.AuthOptional, controllers.GetPaypalPaymentStatus)
+	r.GET("/api/payment/paypal/status/:id", middleware.AuthRequired, controllers.GetPaypalPaymentStatus)
 	r.POST("/api/payment/paypal/create", middleware.AuthOptional, controllers.CreatePaypalPayment)
-	r.POST("/api/payment/paypal/capture", middleware.AuthOptional, controllers.CapturePaypalPayment)
+	r.POST("/api/payment/paypal/capture", middleware.AuthRequired, controllers.CapturePaypalPayment)
+
+	// Mock / Simulator Payment Routes (chỉ bật khi APP_ENV=demo và ENABLE_PAYMENT_MOCK=true, bắt buộc quyền Admin)
+	mockEnabled := strings.EqualFold(os.Getenv("APP_ENV"), "demo") &&
+		strings.EqualFold(os.Getenv("ENABLE_PAYMENT_MOCK"), "true")
+	if mockEnabled {
+		r.POST("/api/payment/momo/mock-ipn/:id",
+			middleware.AuthRequired, middleware.AdminRequired, controllers.MockMomoIPN)
+		r.POST("/api/payment/paypal/mock-capture/:id",
+			middleware.AuthRequired, middleware.AdminRequired, controllers.MockPaypalCapture)
+		r.POST("/api/payment/momo/simulator-ipn",
+			middleware.AuthRequired, middleware.AdminRequired, controllers.MomoSimulatorIPN)
+	}
 
 	// COD & Order Tracking Routes (hỗ trợ cả khách đăng nhập và khách vãng lai)
 	r.POST("/api/orders/quote", controllers.GetOrderQuote)
 	r.POST("/api/orders/cod/create", middleware.AuthOptional, controllers.CreateCodOrder)
-	r.POST("/api/orders/:id/confirm-receipt", middleware.AuthOptional, controllers.ConfirmReceiptOrder)
-	r.GET("/api/orders/my-orders", middleware.AuthOptional, controllers.GetMyOrders)
+	r.POST("/api/orders/:id/confirm-receipt", middleware.AuthRequired, controllers.ConfirmReceiptOrder)
+	r.GET("/api/orders/my-orders", middleware.AuthRequired, controllers.GetMyOrders)
 
 	// Thẻ ATM Nội Địa NCB — Xác thực OTP 1-chạm
 	r.POST("/api/payment/atm/verify-otp", middleware.AuthOptional, controllers.VerifyAtmOtpPayment)

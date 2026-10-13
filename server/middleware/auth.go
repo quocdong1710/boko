@@ -32,7 +32,7 @@ func AuthOptional(c *gin.Context) {
 
 	if err == nil && token.Valid {
 		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			if uid, ok := claims["user_id"].(float64); ok {
+			if uid, ok := claims["user_id"].(float64); ok && uid > 0 {
 				c.Set("user_id", uint(uid))
 			}
 			if email, ok := claims["email"].(string); ok {
@@ -84,10 +84,19 @@ func AuthRequired(c *gin.Context) {
 		return
 	}
 
+	uidFloat, okUID := claims["user_id"].(float64)
+	if !okUID || uidFloat <= 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Token người dùng không hợp lệ"})
+		c.Abort()
+		return
+	}
+	email, _ := claims["email"].(string)
+	role, _ := claims["role"].(string)
+
 	// Gắn thông tin user vào context để handler dùng
-	c.Set("user_id", uint(claims["user_id"].(float64)))
-	c.Set("email", claims["email"].(string))
-	c.Set("role", claims["role"].(string))
+	c.Set("user_id", uint(uidFloat))
+	c.Set("email", email)
+	c.Set("role", role)
 
 	c.Next()
 }

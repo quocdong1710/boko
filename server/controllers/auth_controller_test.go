@@ -2,6 +2,9 @@ package controllers
 
 import (
 	"testing"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"boko/config"
 	"boko/models"
@@ -33,3 +36,28 @@ func TestUserPublicPayloadIncludesDecryptedPhone(t *testing.T) {
 		t.Fatalf("expected decrypted phone %q, got %q", plainPhone, phone)
 	}
 }
+
+func TestLoginDummyHashInitializedAndValidCost(t *testing.T) {
+	hash, err := loginDummyHash()
+	if err != nil {
+		t.Fatalf("expected nil error from loginDummyHash, got %v", err)
+	}
+	if len(hash) == 0 {
+		t.Fatal("expected non-empty dummy bcrypt hash")
+	}
+	cost, err := bcrypt.Cost(hash)
+	if err != nil {
+		t.Fatalf("invalid bcrypt hash: %v", err)
+	}
+	if cost != bcrypt.DefaultCost {
+		t.Fatalf("expected cost %d, got %d", bcrypt.DefaultCost, cost)
+	}
+
+	start := time.Now()
+	_ = bcrypt.CompareHashAndPassword(hash, []byte("wrong-password-probe"))
+	elapsed := time.Since(start)
+	if elapsed < 5*time.Millisecond {
+		t.Fatalf("expected bcrypt compare to take measurable work-factor time, took %v", elapsed)
+	}
+}
+

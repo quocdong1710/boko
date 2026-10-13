@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +17,44 @@ import (
 )
 
 // ==================== PAYMENT CONTROLLER ====================
+
+func loadOwnedPaymentOrder(c *gin.Context) (models.Order, bool) {
+	value, exists := c.Get("user_id")
+	uid, ok := value.(uint)
+	if !exists || !ok || uid == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Yêu cầu đăng nhập"})
+		return models.Order{}, false
+	}
+
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil || id == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID đơn hàng không hợp lệ"})
+		return models.Order{}, false
+	}
+
+	var order models.Order
+	if err := config.DB.Where("id = ? AND user_id = ?", uint(id), uid).
+		First(&order).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng"})
+		return models.Order{}, false
+	}
+	return order, true
+}
+
+func requireAdminActor(c *gin.Context) (uint, bool) {
+	value, exists := c.Get("user_id")
+	uid, ok := value.(uint)
+	if !exists || !ok || uid == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Yêu cầu đăng nhập"})
+		return 0, false
+	}
+	role, _ := c.Get("role")
+	if role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Chỉ admin mới có quyền thực hiện"})
+		return 0, false
+	}
+	return uid, true
+}
 
 // CreateMomoPayment — Tạo yêu cầu thanh toán MoMo cho một đơn hàng (Phương án A)
 func CreateMomoPayment(c *gin.Context) {
@@ -34,45 +73,21 @@ func CreateMomoPayment(c *gin.Context) {
 		return
 	}
 
-	// Xác định user_id: ưu tiên từ JWT token đã xác thực, nếu không có thì liên kết qua email hoặc tài khoản khách
-	var currentUserID uint
-	if val, exists := c.Get("user_id"); exists {
-		if uid, ok := val.(uint); ok {
-			currentUserID = uid
-		}
-	}
-
-	if currentUserID == 0 {
-		targetEmail := input.Email
-		if targetEmail == "" {
-			targetEmail = "guest@boko.com"
-		}
-		var user models.User
-		if err := config.DB.Where("email = ?", targetEmail).First(&user).Error; err != nil {
-			user = models.User{
-				Email: targetEmail,
-				Name:  "Khách mua hàng",
-				Role:  "customer",
-			}
-			config.DB.Create(&user)
-		}
-		currentUserID = user.ID
-	}
-
 	// 1. Tìm đơn hàng có sẵn hoặc tạo đơn hàng mới nếu truyền amount
 	var order models.Order
 	if input.OrderID > 0 {
-		var err error
-		if val, exists := c.Get("user_id"); exists {
-			err = config.DB.Where("id = ? AND user_id = ?", input.OrderID, val.(uint)).First(&order).Error
-		} else {
-			err = config.DB.First(&order, input.OrderID).Error
+		val, exists := c.Get("user_id")
+		uid, ok := val.(uint)
+		if !exists || !ok || uid == 0 {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Yêu cầu đăng nhập để thanh toán đơn hàng có sẵn"})
+			return
 		}
-		if err != nil {
+		if err := config.DB.Where("id = ? AND user_id = ?", input.OrderID, uid).First(&order).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng hoặc bạn không có quyền truy cập"})
 			return
 		}
 	} else if input.Amount >= 1000 {
+		currentUserID := resolvePaypalUserID(c, input.Email)
 		order = models.Order{
 			UserID:          currentUserID,
 			Total:           input.Amount,
@@ -92,9 +107,13 @@ func CreateMomoPayment(c *gin.Context) {
 		return
 	}
 
-	// 2. Kiểm tra nếu đơn đã thanh toán rồi
+	// 2. Kiểm tra nếu đơn đã thanh toán hoặc đã kết thúc/hủy
 	if order.PaymentStatus == "paid" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn hàng này đã được thanh toán thành công trước đó"})
+		return
+	}
+	if order.Status == "cancelled" || order.Status == "completed" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn hàng không ở trạng thái cho phép thanh toán"})
 		return
 	}
 
@@ -142,12 +161,17 @@ func MomoIPN(c *gin.Context) {
 		return
 	}
 
-	// 2. Tìm đơn hàng theo payment_order_id hoặc parse từ OrderID (BOKO_<id>_<timestamp>)
+	// 2. Tìm đơn hàng theo payment_order_id hoặc parse từ OrderID (BOKO_<id>_<timestamp>) khi đơn chưa gắn mã khác
 	var order models.Order
 	if err := config.DB.Where("payment_order_id = ?", ipnReq.OrderID).First(&order).Error; err != nil {
 		var id uint
-		if n, _ := fmt.Sscanf(ipnReq.OrderID, "BOKO_%d_", &id); n == 1 {
-			config.DB.Where("id = ?", id).First(&order)
+		if n, _ := fmt.Sscanf(ipnReq.OrderID, "BOKO_%d_", &id); n == 1 && id > 0 {
+			var candidate models.Order
+			if err2 := config.DB.Where("id = ?", id).First(&candidate).Error; err2 == nil {
+				if candidate.PaymentOrderID == "" || candidate.PaymentOrderID == ipnReq.OrderID {
+					order = candidate
+				}
+			}
 		}
 	}
 
@@ -156,16 +180,22 @@ func MomoIPN(c *gin.Context) {
 		return
 	}
 
-	// 3. Cơ chế Idempotency: Nếu đơn đã thanh toán rồi, không cập nhật lại, trả ngay 204
-	if order.PaymentStatus == "paid" {
+	// 3. Đối soát số tiền thanh toán
+	if ipnReq.Amount != int64(order.Total) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid amount (Số tiền thanh toán không khớp)"})
+		return
+	}
+
+	// 4. Cơ chế Idempotency & State Guard: Nếu đơn đã thanh toán hoặc không còn ở trạng thái pending, không cập nhật lại
+	if order.PaymentStatus == "paid" || order.Status == "cancelled" || order.Status == "completed" {
 		c.Status(http.StatusNoContent)
 		return
 	}
 
-	// 4. Cập nhật trạng thái đơn hàng dựa trên resultCode của MoMo
+	// 5. Cập nhật trạng thái đơn hàng nguyên tử dựa trên resultCode của MoMo
 	if ipnReq.ResultCode == 0 {
 		// Thanh toán thành công
-		config.DB.Model(&order).Updates(map[string]interface{}{
+		config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(map[string]interface{}{
 			"payment_status":   "paid",
 			"status":           "confirmed",
 			"payment_trans_id": strconv.FormatInt(ipnReq.TransID, 10),
@@ -173,7 +203,7 @@ func MomoIPN(c *gin.Context) {
 		})
 	} else {
 		// Thanh toán thất bại hoặc người dùng hủy
-		config.DB.Model(&order).Updates(map[string]interface{}{
+		config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(map[string]interface{}{
 			"payment_status": "failed",
 		})
 	}
@@ -183,33 +213,19 @@ func MomoIPN(c *gin.Context) {
 }
 
 // GetPaymentStatus — Kiểm tra trạng thái thanh toán của đơn hàng (có tự động sync Gateway)
-// GetPaymentStatus — Lấy thông tin trạng thái thanh toán đơn hàng (hỗ trợ cả Callback & User Profile)
 func GetPaymentStatus(c *gin.Context) {
-	orderIDStr := c.Param("id")
-	orderID, err := strconv.ParseUint(orderIDStr, 10, 32)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "ID đơn hàng không hợp lệ"})
+	order, ok := loadOwnedPaymentOrder(c)
+	if !ok {
 		return
 	}
 
-	var order models.Order
-	var dbErr error
-	if userID, exists := c.Get("user_id"); exists {
-		dbErr = config.DB.Where("id = ? AND user_id = ?", uint(orderID), userID).First(&order).Error
-	} else {
-		dbErr = config.DB.First(&order, uint(orderID)).Error
-	}
-
-	if dbErr != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng"})
-		return
-	}
-
-	// Tự động kiểm tra trực tiếp MoMo Gateway nếu đơn đang unpaid mà đã có mã MoMo Order
-	if order.PaymentStatus != "paid" && order.PaymentOrderID != "" && order.PaymentRequestID != "" {
+	// Tự động kiểm tra trực tiếp MoMo Gateway nếu đơn MoMo đang unpaid mà đã có mã MoMo Order
+	if (order.PaymentMethod == "momo" || order.PaymentMethod == "") &&
+		order.PaymentStatus != "paid" && order.Status == "pending" &&
+		order.PaymentOrderID != "" && order.PaymentRequestID != "" {
 		if queryResp, err := services.QueryMomoTransaction(order.PaymentOrderID, order.PaymentRequestID); err == nil {
-			if queryResp.ResultCode == 0 {
-				config.DB.Model(&order).Updates(map[string]interface{}{
+			if queryResp.ResultCode == 0 && (queryResp.Amount == 0 || queryResp.Amount == int64(order.Total)) {
+				config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(map[string]interface{}{
 					"payment_status":   "paid",
 					"status":           "confirmed",
 					"payment_trans_id": strconv.FormatInt(queryResp.TransID, 10),
@@ -234,11 +250,16 @@ func GetPaymentStatus(c *gin.Context) {
 	})
 }
 
-// MockMomoIPN — API tiện ích cho lập trình viên test giả lập IPN thành công nội bộ
+// MockMomoIPN — API tiện ích cho admin demo test giả lập IPN thành công nội bộ
 func MockMomoIPN(c *gin.Context) {
+	actorID, ok := requireAdminActor(c)
+	if !ok {
+		return
+	}
+
 	orderIDStr := c.Param("id")
 	orderID, err := strconv.ParseUint(orderIDStr, 10, 32)
-	if err != nil {
+	if err != nil || orderID == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "ID đơn hàng không hợp lệ"})
 		return
 	}
@@ -249,13 +270,32 @@ func MockMomoIPN(c *gin.Context) {
 		return
 	}
 
+	if order.Status == "cancelled" || order.Status == "completed" ||
+		order.PaymentStatus == "paid" || order.PaymentMethod != "momo" ||
+		order.Status != "pending" || order.PaymentStatus != "unpaid" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn không ở trạng thái có thể giả lập"})
+		return
+	}
+
 	mockTransID := fmt.Sprintf("MOCK_TRANS_%d", time.Now().UnixMilli())
-	config.DB.Model(&order).Updates(map[string]interface{}{
-		"payment_status":   "paid",
-		"status":           "confirmed",
-		"payment_trans_id": mockTransID,
-		"payment_method":   "momo",
-	})
+	res := config.DB.Model(&order).
+		Where("status = ? AND payment_status = ? AND payment_method = ?",
+			"pending", "unpaid", "momo").
+		Updates(map[string]interface{}{
+			"payment_status":   "paid",
+			"status":           "confirmed",
+			"payment_trans_id": mockTransID,
+		})
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể cập nhật thanh toán demo"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Đơn đã đổi trạng thái"})
+		return
+	}
+
+	log.Printf("[AUDIT][SIMULATED_PAYMENT] simulated=true action=mock_momo_ipn actor_user_id=%d order_id=%d trans_id=%s", actorID, order.ID, mockTransID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":          "✅ Giả lập Webhook MoMo IPN thành công!",
@@ -263,11 +303,17 @@ func MockMomoIPN(c *gin.Context) {
 		"payment_status":   "paid",
 		"status":           "confirmed",
 		"payment_trans_id": mockTransID,
+		"simulated":        true,
 	})
 }
 
 // MomoSimulatorIPN — Xử lý thanh toán từ Cổng Giả Lập MoMo Sandbox với ký số HMAC-SHA256 đầy đủ
 func MomoSimulatorIPN(c *gin.Context) {
+	actorID, ok := requireAdminActor(c)
+	if !ok {
+		return
+	}
+
 	var input struct {
 		OrderID         string `json:"order_id"`
 		ResultCode      int    `json:"result_code"`
@@ -293,6 +339,13 @@ func MomoSimulatorIPN(c *gin.Context) {
 
 	if order.ID == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng tương ứng"})
+		return
+	}
+
+	if order.Status == "cancelled" || order.Status == "completed" ||
+		order.PaymentStatus == "paid" || order.PaymentMethod != "momo" ||
+		order.Status != "pending" || order.PaymentStatus != "unpaid" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn không ở trạng thái có thể giả lập"})
 		return
 	}
 
@@ -357,54 +410,62 @@ func MomoSimulatorIPN(c *gin.Context) {
 			"success":             false,
 			"security_status":     "BLOCKED_TAMPERING_DETECTED",
 			"error":               "CẢNH BÁO AN TOÀN TMĐT: Chữ ký số HMAC-SHA256 không hợp lệ hoặc gói tin đã bị can thiệp! Hệ thống từ chối cập nhật đơn hàng.",
-			"raw_signature_data":  rawSignature,
 			"submitted_signature": submittedSignature,
-			"expected_signature":  validSignature,
 			"tampered":            true,
 		})
 		return
 	}
 
-	// 4. Cơ chế Idempotency
-	if order.PaymentStatus == "paid" && input.ResultCode == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"success":          true,
-			"message":          "Đơn hàng này đã được thanh toán từ trước (Idempotency Safe).",
-			"order_id":         order.ID,
-			"payment_order_id": momoOrderID,
-			"redirect_url": fmt.Sprintf("/payment/momo-callback?orderId=%s&resultCode=0&message=%s&transId=%s&amount=%d",
-				momoOrderID, message, order.PaymentTransID, int64(order.Total)),
-		})
-		return
+	// 4. Cập nhật trạng thái đơn hàng có điều kiện nguyên tử
+	if input.ResultCode == 0 {
+		res := config.DB.Model(&order).
+			Where("status = ? AND payment_status = ? AND payment_method = ?",
+				"pending", "unpaid", "momo").
+			Updates(map[string]interface{}{
+				"payment_status":     "paid",
+				"status":             "confirmed",
+				"payment_trans_id":   strconv.FormatInt(transID, 10),
+				"payment_method":     "momo",
+				"payment_order_id":   momoOrderID,
+				"payment_request_id": momoRequestID,
+			})
+		if res.Error != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể cập nhật thanh toán demo"})
+			return
+		}
+		if res.RowsAffected == 0 {
+			c.JSON(http.StatusConflict, gin.H{"error": "Đơn đã đổi trạng thái"})
+			return
+		}
+	} else {
+		res := config.DB.Model(&order).
+			Where("status = ? AND payment_status = ? AND payment_method = ?",
+				"pending", "unpaid", "momo").
+			Updates(map[string]interface{}{
+				"payment_status": "failed",
+			})
+		if res.Error != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể cập nhật thanh toán demo"})
+			return
+		}
+		if res.RowsAffected == 0 {
+			c.JSON(http.StatusConflict, gin.H{"error": "Đơn đã đổi trạng thái"})
+			return
+		}
 	}
 
-	// 5. Cập nhật trạng thái đơn hàng
-	if input.ResultCode == 0 {
-		config.DB.Model(&order).Updates(map[string]interface{}{
-			"payment_status":     "paid",
-			"status":             "confirmed",
-			"payment_trans_id":   strconv.FormatInt(transID, 10),
-			"payment_method":     "momo",
-			"payment_order_id":   momoOrderID,
-			"payment_request_id": momoRequestID,
-		})
-	} else {
-		config.DB.Model(&order).Updates(map[string]interface{}{
-			"payment_status": "failed",
-		})
-	}
+	log.Printf("[AUDIT][SIMULATED_PAYMENT] simulated=true action=momo_simulator_ipn actor_user_id=%d order_id=%d result_code=%d trans_id=%d", actorID, order.ID, input.ResultCode, transID)
 
 	c.JSON(http.StatusOK, gin.H{
-		"success":            true,
-		"security_status":    "SIGNATURE_VERIFIED_HMAC_SHA256",
-		"message":            "Xác thực chữ ký điện tử HMAC-SHA256 thành công. Giao dịch đã được cập nhật an toàn.",
-		"order_id":           order.ID,
-		"payment_order_id":   momoOrderID,
-		"trans_id":           strconv.FormatInt(transID, 10),
-		"amount":             order.Total,
-		"result_code":        input.ResultCode,
-		"raw_signature_data": rawSignature,
-		"signature":          validSignature,
+		"success":          true,
+		"simulated":        true,
+		"security_status":  "SIGNATURE_VERIFIED_HMAC_SHA256",
+		"message":          "Xác thực chữ ký điện tử HMAC-SHA256 thành công. Giao dịch đã được cập nhật an toàn.",
+		"order_id":         order.ID,
+		"payment_order_id": momoOrderID,
+		"trans_id":         strconv.FormatInt(transID, 10),
+		"amount":           order.Total,
+		"result_code":      input.ResultCode,
 		"redirect_url": fmt.Sprintf("/payment/momo-callback?orderId=%s&resultCode=%d&message=%s&transId=%d&amount=%d",
 			momoOrderID, input.ResultCode, message, transID, int64(order.Total)),
 	})
@@ -452,22 +513,21 @@ func CreatePaypalPayment(c *gin.Context) {
 		return
 	}
 
-	currentUserID := resolvePaypalUserID(c, input.Email)
-
 	// 1. Tìm đơn hàng có sẵn hoặc tạo đơn hàng mới nếu truyền amount
 	var order models.Order
 	if input.OrderID > 0 {
-		var err error
-		if val, exists := c.Get("user_id"); exists {
-			err = config.DB.Where("id = ? AND user_id = ?", input.OrderID, val.(uint)).First(&order).Error
-		} else {
-			err = config.DB.First(&order, input.OrderID).Error
+		val, exists := c.Get("user_id")
+		uid, ok := val.(uint)
+		if !exists || !ok || uid == 0 {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Yêu cầu đăng nhập để thanh toán đơn hàng có sẵn"})
+			return
 		}
-		if err != nil {
+		if err := config.DB.Where("id = ? AND user_id = ?", input.OrderID, uid).First(&order).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng hoặc bạn không có quyền truy cập"})
 			return
 		}
 	} else if input.Amount >= 1000 {
+		currentUserID := resolvePaypalUserID(c, input.Email)
 		order = models.Order{
 			UserID:          currentUserID,
 			Total:           input.Amount,
@@ -487,9 +547,13 @@ func CreatePaypalPayment(c *gin.Context) {
 		return
 	}
 
-	// 2. Kiểm tra nếu đơn đã thanh toán rồi
+	// 2. Kiểm tra nếu đơn đã thanh toán hoặc đã hủy/hoàn tất
 	if order.PaymentStatus == "paid" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn hàng này đã được thanh toán thành công trước đó"})
+		return
+	}
+	if order.Status == "cancelled" || order.Status == "completed" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn hàng không ở trạng thái cho phép thanh toán"})
 		return
 	}
 
@@ -526,8 +590,15 @@ func CreatePaypalPayment(c *gin.Context) {
 	})
 }
 
-// CapturePaypalPayment — Thu tiền đơn PayPal đã được user approve
+// CapturePaypalPayment — Thu tiền đơn PayPal đã được user approve (bắt buộc quyền sở hữu)
 func CapturePaypalPayment(c *gin.Context) {
+	value, exists := c.Get("user_id")
+	uid, ok := value.(uint)
+	if !exists || !ok || uid == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Yêu cầu đăng nhập"})
+		return
+	}
+
 	var input struct {
 		PaypalOrderID string `json:"paypal_order_id" binding:"required"`
 	}
@@ -537,18 +608,11 @@ func CapturePaypalPayment(c *gin.Context) {
 		return
 	}
 
-	// 1. Tìm đơn hàng theo mã đơn PayPal (kèm user nếu đã đăng nhập)
+	// 1. Tìm đơn hàng theo mã đơn PayPal và bắt buộc khớp chủ sở hữu user_id
 	var order models.Order
-	if val, exists := c.Get("user_id"); exists {
-		if err := config.DB.Where("payment_order_id = ? AND user_id = ?", input.PaypalOrderID, val.(uint)).First(&order).Error; err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng tương ứng"})
-			return
-		}
-	} else {
-		if err := config.DB.Where("payment_order_id = ?", input.PaypalOrderID).First(&order).Error; err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng tương ứng"})
-			return
-		}
+	if err := config.DB.Where("payment_order_id = ? AND user_id = ?", input.PaypalOrderID, uid).First(&order).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng tương ứng"})
+		return
 	}
 
 	// 2. Cơ chế Idempotency: Nếu đơn đã thanh toán rồi, không capture lại
@@ -560,16 +624,21 @@ func CapturePaypalPayment(c *gin.Context) {
 		return
 	}
 
+	if order.Status == "cancelled" || order.Status == "completed" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn hàng không ở trạng thái cho phép thanh toán"})
+		return
+	}
+
 	// 3. Capture + đối chiếu số tiền trong service
 	cap, err := services.CapturePaypalOrder(input.PaypalOrderID, order.Total)
 	if err != nil {
-		config.DB.Model(&order).Updates(map[string]interface{}{"payment_status": "failed"})
+		config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(map[string]interface{}{"payment_status": "failed"})
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	// 4. Đánh dấu đã thanh toán (giống IPN MoMo)
-	config.DB.Model(&order).Updates(map[string]interface{}{
+	config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(map[string]interface{}{
 		"payment_status":   "paid",
 		"status":           "confirmed",
 		"payment_trans_id": cap.CaptureID,
@@ -586,30 +655,16 @@ func CapturePaypalPayment(c *gin.Context) {
 
 // GetPaypalPaymentStatus — Kiểm tra trạng thái thanh toán PayPal của đơn hàng (có tự động sync Gateway)
 func GetPaypalPaymentStatus(c *gin.Context) {
-	orderIDStr := c.Param("id")
-	orderID, err := strconv.ParseUint(orderIDStr, 10, 32)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "ID đơn hàng không hợp lệ"})
+	order, ok := loadOwnedPaymentOrder(c)
+	if !ok {
 		return
 	}
 
-	var order models.Order
-	var dbErr error
-	if userID, exists := c.Get("user_id"); exists {
-		dbErr = config.DB.Where("id = ? AND user_id = ?", uint(orderID), userID).First(&order).Error
-	} else {
-		dbErr = config.DB.First(&order, uint(orderID)).Error
-	}
-
-	if dbErr != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng"})
-		return
-	}
-
-	// Tự động đồng bộ với PayPal nếu đơn đang unpaid mà đã có mã PayPal Order
-	if order.PaymentStatus != "paid" && order.PaymentOrderID != "" {
+	// Tự động đồng bộ với PayPal nếu đơn PayPal đang unpaid mà đã có mã PayPal Order
+	if (order.PaymentMethod == "paypal" || order.PaymentMethod == "") &&
+		order.PaymentStatus != "paid" && order.Status == "pending" && order.PaymentOrderID != "" {
 		if st, err := services.QueryPaypalOrder(order.PaymentOrderID); err == nil && st.Status == "COMPLETED" {
-			config.DB.Model(&order).Updates(map[string]interface{}{
+			config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(map[string]interface{}{
 				"payment_status":   "paid",
 				"status":           "confirmed",
 				"payment_trans_id": st.ID,
@@ -633,11 +688,16 @@ func GetPaypalPaymentStatus(c *gin.Context) {
 	})
 }
 
-// MockPaypalCapture — API tiện ích cho lập trình viên test giả lập capture thành công nội bộ
+// MockPaypalCapture — API tiện ích cho admin demo test giả lập capture thành công nội bộ
 func MockPaypalCapture(c *gin.Context) {
+	actorID, ok := requireAdminActor(c)
+	if !ok {
+		return
+	}
+
 	orderIDStr := c.Param("id")
 	orderID, err := strconv.ParseUint(orderIDStr, 10, 32)
-	if err != nil {
+	if err != nil || orderID == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "ID đơn hàng không hợp lệ"})
 		return
 	}
@@ -648,13 +708,32 @@ func MockPaypalCapture(c *gin.Context) {
 		return
 	}
 
+	if order.Status == "cancelled" || order.Status == "completed" ||
+		order.PaymentStatus == "paid" || order.PaymentMethod != "paypal" ||
+		order.Status != "pending" || order.PaymentStatus != "unpaid" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn không ở trạng thái có thể giả lập"})
+		return
+	}
+
 	mockTransID := fmt.Sprintf("MOCK_PAYPAL_%d", time.Now().UnixMilli())
-	config.DB.Model(&order).Updates(map[string]interface{}{
-		"payment_status":   "paid",
-		"status":           "confirmed",
-		"payment_trans_id": mockTransID,
-		"payment_method":   "paypal",
-	})
+	res := config.DB.Model(&order).
+		Where("status = ? AND payment_status = ? AND payment_method = ?",
+			"pending", "unpaid", "paypal").
+		Updates(map[string]interface{}{
+			"payment_status":   "paid",
+			"status":           "confirmed",
+			"payment_trans_id": mockTransID,
+		})
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể cập nhật thanh toán demo"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Đơn đã đổi trạng thái"})
+		return
+	}
+
+	log.Printf("[AUDIT][SIMULATED_PAYMENT] simulated=true action=mock_paypal_capture actor_user_id=%d order_id=%d trans_id=%s", actorID, order.ID, mockTransID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":          "✅ Giả lập capture PayPal thành công!",
@@ -662,5 +741,6 @@ func MockPaypalCapture(c *gin.Context) {
 		"payment_status":   "paid",
 		"status":           "confirmed",
 		"payment_trans_id": mockTransID,
+		"simulated":        true,
 	})
 }

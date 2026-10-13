@@ -164,12 +164,9 @@ export async function confirmOrderReceivedApi(orderId: number | string): Promise
  * Lấy danh sách lịch sử đơn hàng của tôi
  * Endpoint: GET /api/orders/my-orders
  */
-export async function getMyOrdersApi(email?: string): Promise<any[]> {
+export async function getMyOrdersApi(): Promise<any[]> {
   const baseUrl = getBackendBaseUrl();
-  let url = `${baseUrl}/api/orders/my-orders`;
-  if (email) {
-    url += `?email=${encodeURIComponent(email)}`;
-  }
+  const url = `${baseUrl}/api/orders/my-orders`;
 
   const response = await fetch(url, {
     method: 'GET',

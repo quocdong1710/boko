@@ -34,45 +34,21 @@ func CreateVnPayPayment(c *gin.Context) {
 		return
 	}
 
-	// Xác định user_id: ưu tiên từ JWT token đã xác thực, nếu không có thì liên kết qua email hoặc tài khoản khách
-	var currentUserID uint
-	if val, exists := c.Get("user_id"); exists {
-		if uid, ok := val.(uint); ok {
-			currentUserID = uid
-		}
-	}
-
-	if currentUserID == 0 {
-		targetEmail := input.Email
-		if targetEmail == "" {
-			targetEmail = "guest@boko.com"
-		}
-		var user models.User
-		if err := config.DB.Where("email = ?", targetEmail).First(&user).Error; err != nil {
-			user = models.User{
-				Email: targetEmail,
-				Name:  "Khách mua hàng",
-				Role:  "customer",
-			}
-			config.DB.Create(&user)
-		}
-		currentUserID = user.ID
-	}
-
 	// 1. Tìm đơn hàng có sẵn hoặc tạo đơn hàng mới nếu truyền amount
 	var order models.Order
 	if input.OrderID > 0 {
-		var err error
-		if val, exists := c.Get("user_id"); exists {
-			err = config.DB.Where("id = ? AND user_id = ?", input.OrderID, val.(uint)).First(&order).Error
-		} else {
-			err = config.DB.First(&order, input.OrderID).Error
+		val, exists := c.Get("user_id")
+		uid, ok := val.(uint)
+		if !exists || !ok || uid == 0 {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Yêu cầu đăng nhập để thanh toán đơn hàng có sẵn"})
+			return
 		}
-		if err != nil {
+		if err := config.DB.Where("id = ? AND user_id = ?", input.OrderID, uid).First(&order).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng hoặc bạn không có quyền truy cập"})
 			return
 		}
 	} else if input.Amount >= 5000 {
+		currentUserID := resolvePaypalUserID(c, input.Email)
 		pm := "vnpay"
 		if input.PaymentMethod != "" {
 			pm = input.PaymentMethod
@@ -99,9 +75,13 @@ func CreateVnPayPayment(c *gin.Context) {
 		return
 	}
 
-	// 2. Kiểm tra nếu đơn đã thanh toán rồi
+	// 2. Kiểm tra nếu đơn đã thanh toán hoặc đã kết thúc/hủy
 	if order.PaymentStatus == "paid" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn hàng này đã được thanh toán thành công trước đó"})
+		return
+	}
+	if order.Status == "cancelled" || order.Status == "completed" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Đơn hàng không ở trạng thái cho phép thanh toán"})
 		return
 	}
 
@@ -150,12 +130,17 @@ func VnPayIPN(c *gin.Context) {
 	transactionStatus := queryParams.Get("vnp_TransactionStatus")
 	transactionNo := queryParams.Get("vnp_TransactionNo")
 
-	// 2. Tìm đơn hàng theo payment_order_id hoặc parse từ txnRef (BOKO_<id>_<timestamp>)
+	// 2. Tìm đơn hàng theo payment_order_id hoặc parse từ txnRef (BOKO_<id>_<timestamp>) khi đơn chưa gắn mã khác
 	var order models.Order
 	if err := config.DB.Where("payment_order_id = ?", txnRef).First(&order).Error; err != nil {
 		var id uint
-		if n, _ := fmt.Sscanf(txnRef, "BOKO_%d_", &id); n == 1 {
-			config.DB.Where("id = ?", id).First(&order)
+		if n, _ := fmt.Sscanf(txnRef, "BOKO_%d_", &id); n == 1 && id > 0 {
+			var candidate models.Order
+			if err2 := config.DB.Where("id = ?", id).First(&candidate).Error; err2 == nil {
+				if candidate.PaymentOrderID == "" || candidate.PaymentOrderID == txnRef {
+					order = candidate
+				}
+			}
 		}
 	}
 
@@ -177,8 +162,8 @@ func VnPayIPN(c *gin.Context) {
 		return
 	}
 
-	// 4. Cơ chế Idempotency: Nếu đơn đã thanh toán rồi, không cập nhật lại
-	if order.PaymentStatus == "paid" {
+	// 4. Cơ chế Idempotency & State Guard: Nếu đơn đã thanh toán hoặc đã hủy/hoàn tất, không cập nhật lại
+	if order.PaymentStatus == "paid" || order.Status == "cancelled" || order.Status == "completed" {
 		c.JSON(http.StatusOK, payments.VnPayIpnResponse{
 			RspCode: "02",
 			Message: "Order already confirmed (Đơn hàng đã được xác nhận trước đó)",
@@ -197,10 +182,10 @@ func VnPayIPN(c *gin.Context) {
 		if order.PaymentMethod == "" {
 			updates["payment_method"] = "vnpay"
 		}
-		config.DB.Model(&order).Updates(updates)
+		config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(updates)
 	} else {
 		// Thanh toán thất bại hoặc người dùng hủy
-		config.DB.Model(&order).Updates(map[string]interface{}{
+		config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(map[string]interface{}{
 			"payment_status": "failed",
 		})
 	}
@@ -214,32 +199,32 @@ func VnPayIPN(c *gin.Context) {
 
 // GetVnPayPaymentStatus — Lấy thông tin trạng thái thanh toán đơn hàng VNPAY
 func GetVnPayPaymentStatus(c *gin.Context) {
-	orderIDStr := c.Param("id")
-	orderID, err := strconv.ParseUint(orderIDStr, 10, 32)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "ID đơn hàng không hợp lệ"})
+	order, ok := loadOwnedPaymentOrder(c)
+	if !ok {
 		return
 	}
 
-	var order models.Order
-	var dbErr error
-	if userID, exists := c.Get("user_id"); exists {
-		dbErr = config.DB.Where("id = ? AND user_id = ?", uint(orderID), userID).First(&order).Error
-	} else {
-		dbErr = config.DB.First(&order, uint(orderID)).Error
-	}
-
-	if dbErr != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Không tìm thấy đơn hàng"})
-		return
-	}
+	isVnPayMethod := order.PaymentMethod == "vnpay" || order.PaymentMethod == "atm" || order.PaymentMethod == ""
 
 	// Nếu request mang các tham số xác thực từ VNPAY Return URL và chữ ký HMAC-SHA512 hợp lệ
 	queryParams := c.Request.URL.Query()
-	if queryParams.Get("vnp_SecureHash") != "" && services.VerifyVnPaySignature(queryParams) {
+	if isVnPayMethod && order.PaymentStatus != "paid" && order.Status == "pending" && queryParams.Get("vnp_SecureHash") != "" && services.VerifyVnPaySignature(queryParams) {
+		txnRef := queryParams.Get("vnp_TxnRef")
+		amountStr := queryParams.Get("vnp_Amount")
 		responseCode := queryParams.Get("vnp_ResponseCode")
+		transactionStatus := queryParams.Get("vnp_TransactionStatus")
 		transactionNo := queryParams.Get("vnp_TransactionNo")
-		if responseCode == "00" && order.PaymentStatus != "paid" {
+
+		vnpAmount, errAmt := strconv.ParseInt(amountStr, 10, 64)
+		refMatches := order.PaymentOrderID != "" && txnRef == order.PaymentOrderID
+		if !refMatches && order.PaymentOrderID == "" {
+			var parsedID uint
+			if n, _ := fmt.Sscanf(txnRef, "BOKO_%d_", &parsedID); n == 1 && parsedID == order.ID {
+				refMatches = true
+			}
+		}
+
+		if refMatches && errAmt == nil && vnpAmount/100 == int64(order.Total) && responseCode == "00" && transactionStatus == "00" {
 			updates := map[string]interface{}{
 				"payment_status":   "paid",
 				"status":           "confirmed",
@@ -248,15 +233,15 @@ func GetVnPayPaymentStatus(c *gin.Context) {
 			if order.PaymentMethod == "" {
 				updates["payment_method"] = "vnpay"
 			}
-			config.DB.Model(&order).Updates(updates)
+			config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(updates)
 			order.PaymentStatus = "paid"
 			order.Status = "confirmed"
 			order.PaymentTransID = transactionNo
 		}
 	}
 
-	// Tự động đối soát trực tiếp với VNPAY Gateway (querydr) nếu đơn chưa paid và đã có mã tham chiếu
-	if order.PaymentStatus != "paid" && order.PaymentOrderID != "" {
+	// Tự động đối soát trực tiếp với VNPAY Gateway (querydr) nếu đơn VNPAY chưa paid và đã có mã tham chiếu
+	if isVnPayMethod && order.PaymentStatus != "paid" && order.Status == "pending" && order.PaymentOrderID != "" {
 		loc := time.FixedZone("ICT", 7*3600)
 		transDate := order.CreatedAt.In(loc).Format("20060102150405")
 		if queryResp, err := services.QueryVnPayTransaction(order.PaymentOrderID, transDate, c.ClientIP()); err == nil {
@@ -269,7 +254,7 @@ func GetVnPayPaymentStatus(c *gin.Context) {
 				if order.PaymentMethod == "" {
 					updates["payment_method"] = "vnpay"
 				}
-				config.DB.Model(&order).Updates(updates)
+				config.DB.Model(&order).Where("status = ? AND payment_status = ?", "pending", "unpaid").Updates(updates)
 				order.PaymentStatus = "paid"
 				order.Status = "confirmed"
 				order.PaymentTransID = queryResp.TransactionNo

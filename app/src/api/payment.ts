@@ -135,6 +135,7 @@ export async function mockMomoIpnApi(orderId: number | string): Promise<{ messag
     method: 'POST',
     headers: {
       Accept: 'application/json',
+      ...authHeaders(),
     },
   });
 
@@ -186,6 +187,7 @@ export async function submitMomoSimulatorApi(
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json',
+      ...authHeaders(),
     },
     body: JSON.stringify({
       order_id: params.orderId,
