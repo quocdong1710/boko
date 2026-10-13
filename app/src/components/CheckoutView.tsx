@@ -407,10 +407,8 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({
         const idempotencyKey = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `IDEMP-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 
         const codItems = displayItems.map((item) => {
-          const numId = Number(item.book.id);
-          if (!Number.isSafeInteger(numId) || numId <= 0) {
-            throw new Error(`Mã sách "${item.book.title}" không hợp lệ`);
-          }
+          const parsed = Number(item.book.id);
+          const numId = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 1;
           return {
             book_id: numId,
             title: item.book.title,
